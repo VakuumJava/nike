@@ -398,38 +398,51 @@ async def admin_edit_incs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_del_bid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Удаление конкретной ставки.
-    Формат: lot_id user_id
+    Удаление конкретной ставки по номеру лота и либо позиции в списке ставок, либо user_id.
+    Формат ввода: lot_id position OR lot_id user_id
     """
     chat_id = update.effective_chat.id
     txt = update.message.text.strip()
     parts = txt.split()
-    if len(parts)<2:
-        await update.message.reply_text(L("wrong_input"))
+    if len(parts) != 2:
+        await update.message.reply_text("Неверный формат. Используйте: lot_id position/user_id")
         return STATE_ADMIN_DEL_BID
 
     try:
-        lid = int(parts[0])
-        bad_uid = int(parts[1])
-    except:
-        await update.message.reply_text(L("wrong_input"))
+        lot_id = int(parts[0])
+        identifier = int(parts[1])  # Это может быть либо позиция ставки, либо user_id
+    except ValueError:
+        await update.message.reply_text("Неверный ввод. Убедитесь, что вы указали числовые значения.")
         return STATE_ADMIN_DEL_BID
 
-    if lid not in LOTS:
+    # Проверяем, существует ли лот
+    if lot_id not in LOTS:
         await update.message.reply_text("Лот не найден.")
         return STATE_MENU
-    lot = LOTS[lid]
-    if bad_uid not in lot["bids"]:
-        await update.message.reply_text("У этого пользователя нет ставки.")
-        return STATE_MENU
 
-    uname = lot["bids"][bad_uid]["username"]
-    lot["bids"].pop(bad_uid)
+    lot = LOTS[lot_id]
 
-    # если одиночное фото и лот не завершён
-    if not lot["is_ended"] and len(lot["media_files"])==1:
-        new_cap = build_caption(lid)
-        kb = build_lot_kb(lid)
+    # Если identifier — это позиция в ставках
+    if 1 <= identifier <= len(lot["bids"]):
+        # Сортируем ставки по убыванию
+        sorted_bids = sorted(lot["bids"].items(), key=lambda x: x[1]["amount"], reverse=True)
+        user_id, bid_data = sorted_bids[identifier - 1]  # Получаем user_id и данные ставки на указанной позиции
+        lot["bids"].pop(user_id)  # Удаляем ставку
+        uname = bid_data["username"]
+        await update.message.reply_text(f"Ставка #{identifier} (пользователь @{uname}) удалена.")
+    elif identifier in lot["bids"]:
+        # Если identifier — это user_id
+        uname = lot["bids"][identifier]["username"]
+        lot["bids"].pop(identifier)
+        await update.message.reply_text(f"Ставка пользователя @{uname} удалена.")
+    else:
+        await update.message.reply_text("Ставка не найдена. Убедитесь, что вы указали правильную позицию или user_id.")
+        return STATE_ADMIN_DEL_BID
+
+    # Обновляем сообщение лота, если оно ещё активно
+    if not lot["is_ended"] and len(lot["media_files"]) == 1:
+        new_cap = build_caption(lot_id)
+        kb = build_lot_kb(lot_id)
         try:
             await context.bot.edit_message_caption(
                 chat_id=CHANNEL_ID,
@@ -438,10 +451,9 @@ async def admin_del_bid(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=kb
             )
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"Ошибка обновления сообщения: {e}")
 
-    await update.message.reply_text(L("bid_removed", uname=uname), reply_markup=main_menu_kb())
     return STATE_MENU
 
 async def admin_ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,20 +746,27 @@ async def schedule_end(context: ContextTypes.DEFAULT_TYPE, lot_id: int):
         await end_lot(context, lot_id)
 
 async def end_lot(context: ContextTypes.DEFAULT_TYPE, lot_id: int):
+    """Завершение аукциона с отображением полных юзернеймов."""
     lot = LOTS[lot_id]
-    lot["is_ended"]=True
-    txt = f"**Лот #{lot_id}**\n{lot['description']}\n\n"
+    lot["is_ended"] = True
+    txt = f"**Лот #{lot_id} завершён**\n\nОписание: {lot['description']}\n\n"
+    admin_msg = f"Лот #{lot_id} завершён.\n"
+
     if lot["bids"]:
-        sorted_b = sorted(lot["bids"].items(), key=lambda x:x[1]["amount"], reverse=True)
-        wuid, data = sorted_b[0]
-        shortn = partial_username(data["username"])
-        amt = data["amount"]
-        txt += f"Победитель: @{shortn} за {amt}$\n"
+        # Сортируем ставки по убыванию
+        sorted_bids = sorted(lot["bids"].items(), key=lambda x: x[1]["amount"], reverse=True)
+        txt += "🏆 Топ-3 победителя:\n"
+        for i, (user_id, bid_data) in enumerate(sorted_bids[:3], 1):
+            username = bid_data["username"]
+            amount = bid_data["amount"]
+            txt += f"{i}. @{username} — {amount}$\n"
+            admin_msg += f"{i}. @{username} — {amount}$\n"
     else:
         txt += "Ставок не было.\n"
-    txt += L("auction_ended")
+        admin_msg += "Ставок не было.\n"
 
-    if len(lot["media_files"])==1:
+    # Отправка итогов в канал
+    if len(lot["media_files"]) == 1:
         try:
             await context.bot.edit_message_caption(
                 chat_id=CHANNEL_ID,
@@ -756,23 +775,41 @@ async def end_lot(context: ContextTypes.DEFAULT_TYPE, lot_id: int):
                 parse_mode=ParseMode.HTML,
                 reply_markup=None
             )
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"Ошибка обновления сообщения: {e}")
     else:
         await context.bot.send_message(CHANNEL_ID, txt, parse_mode=ParseMode.HTML)
 
-    own = lot["owner_id"]
-    await context.bot.send_message(own, f"Лот #{lot_id} завершён.")
+    # Отправка уведомления владельцу лота
+    owner = lot["owner_id"]
+    await context.bot.send_message(owner, admin_msg)
 
-async def schedule_last_call(context: ContextTypes.DEFAULT_TYPE, lot_id: int, ratio=0.9):
+async def schedule_last_call(context: ContextTypes.DEFAULT_TYPE, lot_id: int):
     lot = LOTS[lot_id]
-    total = (lot["end_time"]-lot["start_time"]).total_seconds()
-    if total<1:
+    total_time = (lot["end_time"] - lot["start_time"]).total_seconds()
+    if total_time > 120:
+        await asyncio.sleep(total_time - 120)  # За 30 секунд до конца
+        if not lot["is_ended"]:
+            await context.bot.send_message(
+                CHANNEL_ID, L("last_call", lot_id=lot_id), parse_mode=ParseMode.HTML
+            )
+
+async def is_subscriber(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Проверка подписки на канал."""
+    try:
+        chat_member = await context.bot.get_chat_member(CHANNEL_ID, user_id)
+        return chat_member.status in ["member", "administrator", "creator"]
+    except Exception:
+        return False
+
+async def auction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    user = query.from_user
+    if not await is_subscriber(context, user.id):
+        await query.answer("Вы должны быть подписчиком канала, чтобы участвовать.", show_alert=True)
         return
-    await asyncio.sleep(total*ratio)
-    if not lot["is_ended"]:
-        txt = L("last_call", lot_id=lot_id)
-        await context.bot.send_message(CHANNEL_ID, txt)
+    # Остальная логика...
 
 # -----------------------------------
 # Auction callback (buy_, bid_, timer_, info_)
@@ -780,20 +817,47 @@ async def schedule_last_call(context: ContextTypes.DEFAULT_TYPE, lot_id: int, ra
 async def auction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    user = query.from_user
+    user = query.from_user  # Получаем пользователя, нажавшего кнопку
     await query.answer()
 
     if data.startswith("buy_"):
         lot_id = int(data.split("_")[1])
         if lot_id not in LOTS:
+            await query.answer("Лот не найден.", show_alert=True)
             return
+
         lot = LOTS[lot_id]
         if lot["is_ended"]:
+            await query.answer("Лот уже завершён.", show_alert=True)
             return
+
+        # Проверяем подписку
+        if not await is_subscriber(context, user.id):
+            await query.answer("Вы должны быть подписчиком канала, чтобы купить этот лот.", show_alert=True)
+            return
+
+        # Завершаем лот
         lot["is_ended"] = True
-        shortn = partial_username(user.username)
-        txt = f"**Лот #{lot_id}**\n{lot['description']}\n\n{L('lot_bought',lot_id=lot_id)}\n"
-        txt += f"Победитель: @{shortn} за {lot['max_price']}$"
+        buyer_username = user.username or "аноним"  # Если username не задан
+        buyer_id = user.id
+
+        # Отправляем сообщение в канал
+        txt = (
+            f"Лот #{lot_id} куплен пользователем @{buyer_username} за {lot['max_price']}$!\n"
+            f"Поздравляем победителя!"
+        )
+        await context.bot.send_message(CHANNEL_ID, txt)
+
+        # Уведомляем владельца лота
+        owner_msg = (
+            f"Ваш лот #{lot_id} куплен!\n"
+            f"Покупатель: @{buyer_username} (ID: {buyer_id})\n"
+            f"Сумма: {lot['max_price']}$."
+        )
+        await context.bot.send_message(lot["owner_id"], owner_msg)
+
+        # Логируем покупку
+        logging.info(f"Лот #{lot_id} куплен @{buyer_username} (ID: {buyer_id}) за {lot['max_price']}$.")
         if len(lot["media_files"])==1:
             try:
                 await context.bot.edit_message_caption(
